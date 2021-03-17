@@ -1,6 +1,8 @@
 package net.degoes.zio
 
+import net.degoes.zio.CatEnsuring.{close, open}
 import zio._
+
 import java.text.NumberFormat
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -18,7 +20,12 @@ object Cat extends App {
    * blocking thread pool, storing the result into a string.
    */
   def readFile(file: String): ZIO[Blocking, IOException, String] =
-    ???
+    effectBlockingIO(scala.io.Source.fromFile(file)).flatMap(f =>
+      ZIO.effect(
+        try f.getLines().mkString
+        finally f.close()
+      ).refineToOrDie[IOException]
+    )
 
   /**
    * EXERCISE
@@ -26,8 +33,11 @@ object Cat extends App {
    * Implement a version of the command-line utility "cat", which dumps the
    * contents of the specified file to standard output.
    */
-  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    ???
+  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] = {
+    args.headOption.map { file =>
+      readFile(file).flatMap(putStrLn(_))
+    }.getOrElse(ZIO.succeed(())).exitCode
+  }
 }
 
 object CatEnsuring extends App {
@@ -48,13 +58,14 @@ object CatEnsuring extends App {
    * Using `ZIO#ensuring`, implement a safe version of `readFile` that cannot
    * fail to close the file, no matter what happens during reading.
    */
-  def readFile(file: String): ZIO[Blocking, IOException, String] =
+  def readFile(file: String): ZIO[Blocking, IOException, String] = {
     ZIO.uninterruptible {
       for {
         source   <- open(file)
-        contents <- ZIO.effect(source.getLines().mkString("\n"))
+        contents <- ZIO.effect(source.getLines().mkString("\n")).ensuring(close(source).orDie)
       } yield contents
     }.refineToOrDie[IOException]
+  }
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
     (for {
@@ -85,7 +96,11 @@ object CatBracket extends App {
    * fail to close the file, no matter what happens during reading.
    */
   def readFile(file: String): ZIO[Blocking, IOException, String] =
-    ???
+    ZIO.bracket(
+      open(file),
+      (source: Source) => close(source).orDie,
+      (source: Source) => ZIO.effect(source.getLines().mkString("\n")).refineToOrDie[IOException]
+    )
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
     (for {
@@ -127,7 +142,7 @@ object SourceManaged extends App {
       val close: ZSource => ZIO[Blocking, Nothing, Unit] =
         _.execute(_.close()).orDie
 
-      ???
+      ZManaged.make(open)(close)
     }
   }
 
@@ -140,7 +155,10 @@ object SourceManaged extends App {
    */
   def readFiles(
     files: List[String]
-  ): ZIO[Blocking with Console, IOException, List[String]] = ???
+  ): ZIO[Blocking with Console, IOException, List[String]] =
+    ZManaged.foreachPar(files)(ZSource.make).use { zsources =>
+      ZIO.foreachPar(zsources)(_.execute(_.getLines().mkString("\n")))
+    }
 
   /**
    * EXERCISE
@@ -151,7 +169,10 @@ object SourceManaged extends App {
    * anything except an error message.
    */
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    ???
+    (for {
+      files <- readFiles(args)
+      _ <- ZIO.foreach(files)(putStrLn(_))
+    } yield ()).exitCode
 }
 
 object CatIncremental extends App {
@@ -178,8 +199,11 @@ object CatIncremental extends App {
    * it is impossible to forget to close an open handle.
    */
   object FileHandle {
-    final def open(file: String): ZIO[Blocking, IOException, FileHandle] =
-      effectBlockingIO(new FileHandle(new FileInputStream(file)))
+    final def make(file: String): ZManaged[Blocking, IOException, FileHandle] = {
+      val open = effectBlocking(new FileHandle(new FileInputStream(file))).refineToOrDie[IOException]
+      val close: FileHandle => ZIO[Blocking, Nothing, Unit] = file => file.close.orDie
+      ZManaged.make(open)(close)
+    }
   }
 
   /**
@@ -189,7 +213,11 @@ object CatIncremental extends App {
    * a time, stopping when there are no more chunks left.
    */
   def cat(fh: FileHandle): ZIO[Blocking with Console, IOException, Unit] =
-    ???
+    fh.read.flatMap {
+      case Some(bytes) => putStrLn(bytes.toArray.map(_.toChar).toString) *> cat(fh)
+      case None => ZIO.succeed(())
+    }
+
 
   /**
    * EXERCISE
@@ -200,15 +228,14 @@ object CatIncremental extends App {
    */
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
     args match {
-      case _ :: Nil =>
+      case fileName :: Nil =>
         /**
          * EXERCISE
          *
          * Open the specified file, safely create and use a file handle to
          * incrementally dump the contents of the file to standard output.
          */
-        ???
-
+        FileHandle.make(fileName).use(cat).exitCode
       case _ => putStrLn("Usage: cat <file>") as ExitCode(2)
     }
 }
